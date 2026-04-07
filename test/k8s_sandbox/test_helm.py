@@ -12,6 +12,7 @@ from pytest import LogCaptureFixture
 from k8s_sandbox._helm import (
     INSPECT_HELM_LABELS,
     INSPECT_HELM_TIMEOUT,
+    INSPECT_K8S_NAMESPACE_PER_SAMPLE,
     INSPECT_SANDBOX_COREDNS_IMAGE,
     Release,
     StaticValuesSource,
@@ -20,7 +21,7 @@ from k8s_sandbox._helm import (
     _get_wait_flag,
     _helm_escape,
     _run_subprocess,
-    get_all_release_names,
+    get_all_releases,
     uninstall,
     validate_no_null_values,
 )
@@ -68,9 +69,9 @@ async def test_cancelling_install_uninstalls():
             await task
 
     assert spy.call_count == 1
-    assert release.release_name not in await get_all_release_names(
-        get_default_namespace(context_name=None), None
-    )
+    ns = get_default_namespace(context_name=None)
+    releases = await get_all_releases(context_name=None, namespace=ns)
+    assert release.release_name not in [name for name, _ in releases]
 
 
 async def test_helm_uninstall_does_not_error_for_release_not_found(
@@ -715,3 +716,121 @@ async def test_helm_labels_appear_on_release_secret(
             assert secret_labels.labels.get(key) == value
     finally:
         await release.uninstall(quiet=True)
+
+
+class TestNamespacePerSample:
+    """Tests for INSPECT_K8S_NAMESPACE_PER_SAMPLE feature."""
+
+    def test_disabled_by_default(self) -> None:
+        release = Release(__file__, None, ValuesSource.none(), None)
+        assert release._namespace_per_sample is False
+        assert release._namespace == get_default_namespace(context_name=None)
+
+    def test_enabled_generates_unique_namespace(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(INSPECT_K8S_NAMESPACE_PER_SAMPLE, "true")
+        release = Release("my_task", None, ValuesSource.none(), None)
+        assert release._namespace_per_sample is True
+        assert release._namespace.startswith("inspect-my-task-i")
+        assert release._namespace != get_default_namespace(context_name=None)
+
+    def test_namespace_format_sanitizes_task_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(INSPECT_K8S_NAMESPACE_PER_SAMPLE, "true")
+        release = Release("My Task!@#Name", None, ValuesSource.none(), None)
+        # Should be lowercase, special chars replaced with dashes, consecutive dashes collapsed
+        assert release._namespace.startswith("inspect-my-task-name-i")
+
+    def test_namespace_truncates_long_task_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(INSPECT_K8S_NAMESPACE_PER_SAMPLE, "true")
+        release = Release(
+            "a-very-long-task-name-that-exceeds-twelve",
+            None,
+            ValuesSource.none(),
+            None,
+        )
+        # Task portion is truncated to 12 chars then trailing dashes stripped
+        # "a-very-long-"[:12] → "a-very-long-" → rstrip('-') → "a-very-long"
+        assert release._namespace.startswith("inspect-a-very-long-i")
+
+    def test_two_releases_get_different_namespaces(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(INSPECT_K8S_NAMESPACE_PER_SAMPLE, "true")
+        r1 = Release("task", None, ValuesSource.none(), None)
+        r2 = Release("task", None, ValuesSource.none(), None)
+        assert r1._namespace != r2._namespace
+
+    async def test_create_namespace_flag_passed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(INSPECT_K8S_NAMESPACE_PER_SAMPLE, "true")
+        release = Release(__file__, None, ValuesSource.none(), None)
+        with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
+            await release.install()
+        args = mock_run.call_args[0][1]
+        assert "--create-namespace" in args
+
+    async def test_create_namespace_flag_not_passed_when_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(INSPECT_K8S_NAMESPACE_PER_SAMPLE, raising=False)
+        monkeypatch.delenv("INSPECT_HELM_CREATE_NAMESPACE", raising=False)
+        release = Release(__file__, None, ValuesSource.none(), None)
+        with patch("k8s_sandbox._helm._run_subprocess", autospec=True) as mock_run:
+            await release.install()
+        args = mock_run.call_args[0][1]
+        assert "--create-namespace" not in args
+
+    async def test_uninstall_deletes_namespace(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(INSPECT_K8S_NAMESPACE_PER_SAMPLE, "true")
+        release = Release(__file__, None, ValuesSource.none(), None)
+        with patch("k8s_sandbox._helm.uninstall") as mock_uninstall:
+            with patch("k8s_sandbox._helm._delete_namespace") as mock_delete_ns:
+                await release.uninstall(quiet=True)
+        mock_uninstall.assert_called_once()
+        mock_delete_ns.assert_called_once_with(release._namespace, None)
+
+    async def test_uninstall_does_not_delete_namespace_when_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(INSPECT_K8S_NAMESPACE_PER_SAMPLE, raising=False)
+        release = Release(__file__, None, ValuesSource.none(), None)
+        with patch("k8s_sandbox._helm.uninstall") as mock_uninstall:
+            with patch("k8s_sandbox._helm._delete_namespace") as mock_delete_ns:
+                await release.uninstall(quiet=True)
+        mock_uninstall.assert_called_once()
+        mock_delete_ns.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("env_value", "expected"),
+        [
+            ("1", True),
+            ("true", True),
+            ("TRUE", True),
+            ("yes", True),
+            ("y", True),
+            ("0", False),
+            ("false", False),
+            ("", False),
+            (None, False),
+        ],
+    )
+    def test_env_var_parsing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        env_value: str | None,
+        expected: bool,
+    ) -> None:
+        if env_value is None:
+            monkeypatch.delenv(INSPECT_K8S_NAMESPACE_PER_SAMPLE, raising=False)
+        else:
+            monkeypatch.setenv(INSPECT_K8S_NAMESPACE_PER_SAMPLE, env_value)
+        release = Release("task", None, ValuesSource.none(), None)
+        assert release._namespace_per_sample is expected

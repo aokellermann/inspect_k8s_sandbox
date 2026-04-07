@@ -8,7 +8,7 @@ from rich.panel import Panel
 from rich.prompt import Confirm
 from rich.table import Table
 
-from k8s_sandbox._helm import Release, get_all_release_names
+from k8s_sandbox._helm import Release, _delete_namespace, _namespace_per_sample_enabled, get_all_releases
 from k8s_sandbox._helm import uninstall as helm_uninstall
 from k8s_sandbox._kubernetes_api import get_current_context_name, get_default_namespace
 
@@ -87,10 +87,12 @@ class HelmReleaseManager:
             title_justify="left",
         )
         table.add_column("Release(s)", no_wrap=True)
+        table.add_column("Namespace")
         table.add_column("Cleanup")
         for release in self._installed_releases:
             table.add_row(
                 release.release_name,
+                release._namespace,
                 f"[blue]inspect sandbox cleanup k8s {release.release_name}[/blue]",
             )
         print("")
@@ -105,19 +107,25 @@ async def uninstall_unmanaged_release(release_name: str) -> None:
     """
     Uninstall a Helm release which is not managed by a HelmReleaseManager.
 
-    Only the current Kubernetes context (as defined by the kubeconfig file) is
-    considered.
+    Searches across all namespaces to find the release.
 
     Args:
       release_name (str): The name of the release to uninstall (e.g. "lsphdyup").
     """
     _print_do_not_interrupt()
-    namespace = get_default_namespace(context_name=None)
-    await helm_uninstall(release_name, namespace, context_name=None, quiet=False)
+    # Search all namespaces to find the release.
+    all_releases = await get_all_releases(context_name=None)
+    match = next((ns for name, ns in all_releases if name == release_name), None)
+    if match is None:
+        # Fall back to default namespace for backwards compatibility.
+        match = get_default_namespace(context_name=None)
+    await helm_uninstall(release_name, match, context_name=None, quiet=False)
+    if _namespace_per_sample_enabled():
+        await _delete_namespace(match, context_name=None)
 
 
 async def uninstall_all_unmanaged_releases() -> None:
-    def _print_table(releases: list[str]) -> None:
+    def _print_table(releases: list[tuple[str, str]]) -> None:
         print("Releases to be uninstalled:")
         table = Table(
             box=box.SQUARE,
@@ -126,31 +134,41 @@ async def uninstall_all_unmanaged_releases() -> None:
             title_justify="left",
         )
         table.add_column("Release")
-        for release in releases:
-            table.add_row(f"[red]{release}[/red]")
+        table.add_column("Namespace")
+        for release, namespace in releases:
+            table.add_row(f"[red]{release}[/red]", namespace)
         print(table)
 
-    namespace = get_default_namespace(context_name=None)
-    releases = await get_all_release_names(namespace, context_name=None)
+    releases = await get_all_releases(context_name=None)
     if len(releases) == 0:
         print(
-            f"No Inspect sandbox releases found in '{namespace}' namespace in your "
+            f"No Inspect sandbox releases found in your "
             f"current Kubernetes context '{get_current_context_name()}'."
         )
         return
     _print_table(releases)
+    namespaces = sorted({ns for _, ns in releases})
+    ns_label = ", ".join(f"'{ns}'" for ns in namespaces)
     if not Confirm.ask(
         f"Are you sure you want to uninstall ALL {len(releases)} Inspect sandbox "
-        f"release(s) in '{namespace}' namespace? If this is a shared namespace, "
+        f"release(s) in {ns_label}? If this is a shared namespace, "
         "this may affect other users.",
     ):
         print("Cancelled.")
         return
     tasks = [
         helm_uninstall(release, namespace, context_name=None, quiet=False)
-        for release in releases
+        for release, namespace in releases
     ]
     await asyncio.gather(*tasks, return_exceptions=True)
+    # Clean up per-sample namespaces.
+    default_ns = get_default_namespace(context_name=None)
+    per_sample_namespaces = [ns for ns in namespaces if ns != default_ns]
+    if per_sample_namespaces:
+        ns_tasks = [
+            _delete_namespace(ns, context_name=None) for ns in per_sample_namespaces
+        ]
+        await asyncio.gather(*ns_tasks, return_exceptions=True)
     print("Complete.")
 
 
