@@ -31,6 +31,7 @@ INSTALL_RETRY_DELAY_SECONDS = 5
 INSPECT_HELM_TIMEOUT = "INSPECT_HELM_TIMEOUT"
 INSPECT_HELM_LABELS = "INSPECT_HELM_LABELS"
 INSPECT_SANDBOX_COREDNS_IMAGE = "INSPECT_SANDBOX_COREDNS_IMAGE"
+INSPECT_K8S_NAMESPACE_PER_SAMPLE = "INSPECT_K8S_NAMESPACE_PER_SAMPLE"
 HELM_CONTEXT_DEADLINE_EXCEEDED_URL = (
     "https://k8s-sandbox.aisi.org.uk/tips/troubleshooting/"
     "#helm-context-deadline-exceeded"
@@ -184,15 +185,32 @@ class Release:
         self._chart_path = chart_path or DEFAULT_CHART
         self._values_source = values_source
         self._context_name = context_name
-        self._namespace = get_default_namespace(context_name)
         # The release name is used in pod names too, so limit it to 8 chars.
         self.release_name = self._generate_release_name()
+        if _namespace_per_sample_enabled():
+            self._namespace = self._generate_namespace(task_name)
+            self._namespace_per_sample = True
+        else:
+            self._namespace = get_default_namespace(context_name)
+            self._namespace_per_sample = False
         self.restarted_container_behavior = restarted_container_behavior
         self.sample_uuid = sample_uuid
         self._extra_values = dict(extra_values) if extra_values else {}
 
     def _generate_release_name(self) -> str:
         return uuid().lower()[:8]
+
+    def _generate_namespace(self, task_name: str) -> str:
+        """Generate a unique namespace name for this release.
+
+        Format mirrors Docker Compose's project naming:
+        ``inspect-{sanitized_task[:12]}-i{release_uuid[:6]}``.
+        """
+        task = re.sub(r"[^a-z\d\-]", "-", task_name.lower())
+        task = re.sub(r"-+", "-", task).strip("-")
+        if not task:
+            task = "task"
+        return f"inspect-{task[:12].rstrip('-')}-i{self.release_name[:6]}"
 
     async def install(self) -> None:
         try:
@@ -229,6 +247,8 @@ class Release:
 
     async def uninstall(self, quiet: bool) -> None:
         await uninstall(self.release_name, self._namespace, self._context_name, quiet)
+        if self._namespace_per_sample:
+            await _delete_namespace(self._namespace, self._context_name)
 
     async def get_sandbox_pods(self) -> dict[str, Pod]:
         client = k8s_client(self._context_name)
@@ -296,7 +316,10 @@ class Release:
                     f"--namespace={self._namespace}",
                     *(
                         ["--create-namespace"]
-                        if os.getenv("INSPECT_HELM_CREATE_NAMESPACE", "false").lower()
+                        if self._namespace_per_sample
+                        or os.getenv(
+                            "INSPECT_HELM_CREATE_NAMESPACE", "false"
+                        ).lower()
                         in {"1", "true", "yes", "y"}
                         else []
                     ),
@@ -462,23 +485,89 @@ async def uninstall(
                 )
 
 
-async def get_all_release_names(namespace: str, context_name: str | None) -> list[str]:
+async def _delete_namespace(namespace: str, context_name: str | None) -> None:
+    """Delete a Kubernetes namespace. Best-effort: logs warnings on failure."""
+    try:
+        result = await _run_subprocess(
+            "kubectl",
+            ["delete", "namespace", namespace, "--ignore-not-found"]
+            + _kubectl_context_args(context_name),
+            capture_output=True,
+        )
+        if not result.success:
+            log_trace(
+                "Failed to delete namespace.",
+                namespace=namespace,
+                stderr=result.stderr,
+            )
+    except Exception as e:
+        log_trace("Failed to delete namespace.", namespace=namespace, error=e)
+
+
+def _namespace_per_sample_enabled() -> bool:
+    return os.getenv(INSPECT_K8S_NAMESPACE_PER_SAMPLE, "false").lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+    }
+
+
+async def get_all_releases(
+    context_name: str | None,
+    namespace: str | None = None,
+) -> list[tuple[str, str]]:
+    """List all Inspect sandbox Helm releases.
+
+    Args:
+        context_name: The kubeconfig context name, or None for the current context.
+        namespace: If provided, only list releases in this namespace. If None,
+            list releases across all namespaces.
+
+    Returns:
+        A list of ``(release_name, namespace)`` tuples.
+    """
+    if namespace is not None:
+        # Single-namespace query: use -q for names only.
+        result = await _run_subprocess(
+            "helm",
+            [
+                "list",
+                "--namespace",
+                namespace,
+                "-q",
+                "--selector",
+                "inspectSandbox=true",
+                "--max",
+                "0",
+            ]
+            + _kubeconfig_context_args(context_name),
+            capture_output=True,
+        )
+        return [(name, namespace) for name in result.stdout.splitlines() if name]
+
+    # All-namespaces query: parse NAME\tNAMESPACE from helm list output.
     result = await _run_subprocess(
         "helm",
         [
             "list",
-            "--namespace",
-            namespace,
-            "-q",
+            "--all-namespaces",
             "--selector",
             "inspectSandbox=true",
             "--max",
             "0",
+            "--output",
+            "json",
         ]
         + _kubeconfig_context_args(context_name),
         capture_output=True,
     )
-    return result.stdout.splitlines()
+    if not result.success or not result.stdout.strip():
+        return []
+    import json
+
+    releases = json.loads(result.stdout)
+    return [(r["name"], r["namespace"]) for r in releases]
 
 
 def _raise_runtime_error(
@@ -608,3 +697,10 @@ def _kubeconfig_context_args(context_name: str | None) -> list[str]:
     if context_name is None:
         return []
     return ["--kube-context", context_name]
+
+
+def _kubectl_context_args(context_name: str | None) -> list[str]:
+    """Formats --context arguments suitable for passing to a `kubectl` subprocess."""
+    if context_name is None:
+        return []
+    return ["--context", context_name]
