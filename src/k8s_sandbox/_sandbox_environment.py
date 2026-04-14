@@ -70,12 +70,16 @@ _TRANSIENT_TYPES = (
 # ExecutableNotFoundError and RuntimeError don't match _TRANSIENT_TYPES today,
 # but are listed defensively: if _TRANSIENT_TYPES ever gains a parent class they
 # inherit from, these entries prevent accidental retries of permanent failures.
-# PermissionError and TimeoutError are OSError subclasses and MUST be excluded.
+# PermissionError, TimeoutError, FileNotFoundError, and IsADirectoryError are
+# OSError subclasses and MUST be excluded — these are permanent failures that
+# will not resolve by retrying.
 _PERMANENT_TYPES = (
     ExecutableNotFoundError,
     RuntimeError,
     PermissionError,
     TimeoutError,
+    FileNotFoundError,
+    IsADirectoryError,
 )
 
 _exec_retry = AsyncRetrying(
@@ -262,11 +266,13 @@ class K8sSandboxEnvironment(SandboxEnvironment):
         op = "K8s execute command in Pod"
         with self._log_op(op, expected_exceptions, **log_kwargs):
             await self._pod.check_for_pod_restart()
+            result: ExecResult[str] | None = None
             async for attempt in _exec_retry:
                 with attempt:
                     result = await self._pod.exec(
                         cmd, input, cwd, env or {}, user, timeout
                     )
+            assert result is not None
             log_trace(f"Completed: {op}.", **(log_kwargs | {"result": result}))
             return result
 
@@ -278,11 +284,39 @@ class K8sSandboxEnvironment(SandboxEnvironment):
                 temp_file.write(contents.encode("utf-8"))
             else:
                 temp_file.write(contents)
+            expected_size = temp_file.tell()
             temp_file.seek(0)
             # Do not log these at error level or re-raise as enriched K8sError.
             expected_exceptions = (PermissionError, IsADirectoryError)
             with self._log_op("K8s write file to Pod", expected_exceptions, file=file):
-                await self._pod.write_file(temp_file.file, Path(file))
+                async for attempt in _exec_retry:
+                    with attempt:
+                        temp_file.seek(0)
+                        log_trace(
+                            f"write_file: writing {expected_size} bytes to"
+                            f" {file} on pod {self._pod.info.name}"
+                        )
+                        await self._pod.write_file(temp_file.file, Path(file))
+                        log_trace(
+                            f"write_file: write returned for {file}"
+                            f" on pod {self._pod.info.name}, verifying..."
+                        )
+                        # Verify size to detect truncated websocket transfers
+                        verify = await self.exec(["stat", "-c", "%s", file], timeout=30)
+                        if verify.success:
+                            actual = int(verify.stdout.strip())
+                            if actual != expected_size:
+                                raise OSError(
+                                    f"write_file truncated: {file} on"
+                                    f" {self._pod.info.name}:"
+                                    f" wrote {actual}/{expected_size} bytes"
+                                )
+                        else:
+                            raise OSError(
+                                f"write_file verify failed: {file} on"
+                                f" {self._pod.info.name}:"
+                                f" {verify.stderr.strip()}"
+                            )
 
     @overload
     async def read_file(self, file: str, text: Literal[True] = True) -> str: ...
@@ -303,7 +337,11 @@ class K8sSandboxEnvironment(SandboxEnvironment):
                 OutputLimitExceededError,
             )
             with self._log_op("K8s read file from Pod", expected_exceptions, file=file):
-                await self._pod.read_file(Path(file), temp_file)
+                async for attempt in _exec_retry:
+                    with attempt:
+                        temp_file.seek(0)
+                        temp_file.truncate()
+                        await self._pod.read_file(Path(file), temp_file)
                 temp_file.seek(0)
                 return (
                     temp_file.read() if not text else temp_file.read().decode("utf-8")
